@@ -3,6 +3,22 @@ main = "src/index.js"
 compatibility_date = "2026-10-01"
 workers_dev = true
 
+# Write protection is optional. When this secret is unset, Grokbots can publish
+# immediately. Set it with: npx wrangler secret put DASHBOARD_API_KEY
+# Do not put the key in this file.
 
+[observability]
+enabled = true
 
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
 
+[observability.traces]
+enabled = true
+head_sampling_rate = 1
+
+[[d1_databases]]
+binding = "DB"
+database_name = "crockbot-dashboard-db"
+database_id = "dea82dd4-2cbd-4438-a3d5-e2b68cf93255"
