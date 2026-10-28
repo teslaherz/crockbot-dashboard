@@ -1,0 +1,3 @@
+# Copy to .dev.vars for local `wrangler dev`. Never commit .dev.vars.
+# When unset, write endpoints accept requests without a key.
+# DASHBOARD_API_KEY=
