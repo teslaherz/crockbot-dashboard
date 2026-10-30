@@ -4,16 +4,21 @@ import test from "node:test";
 import worker, {
   berlinParts,
   botProfile,
+  botSlug,
+  ensureSeen,
   extractTitle,
+  formatChatStamp,
   formatFullStamp,
   formatListStamp,
   generateId,
   keysMatch,
   makeSummary,
+  messagePreview,
   normalizeId,
   renderMarkdown,
+  unreadCount,
 } from "../src/index.js";
-import { createMockDb } from "./d1-mock.js";
+import { adaptDb, createMockDb, createRawDb } from "./d1-mock.js";
 
 const ORIGIN = "https://crockbot-dashboard.teslaherz.workers.dev";
 
@@ -86,6 +91,26 @@ test("normalizeId, summaries, titles, and Berlin stamps", () => {
   assert.equal(botProfile("Bote · E-Mail-Verwalter").icon, "mail");
   assert.equal(botProfile("Elon · Programmierer Smarthome").short, "Elon");
   assert.equal(botProfile("Händler").icon, "tag");
+  assert.equal(botSlug("Bote · E-Mail-Verwalter"), "bote-e-mail-verwalter");
+  assert.equal(botSlug("Bote · E-Mail-Verwalter"), botSlug("  bote · e-mail-verwalter  "));
+  assert.equal(messagePreview("# Titel\n\n**Erste** Zeile\nZweite"), "Titel");
+  assert.equal(messagePreview("Nur `code` und [ein Link](https://example.com)"), "Nur code und ein Link");
+  assert.equal(formatChatStamp("2026-10-28T15:42:00.000Z"), "Mi");
+  assert.equal(formatChatStamp("2026-10-29T12:00:00.000Z"), "Gestern");
+  assert.equal(formatChatStamp("2020-01-15T14:05:00.000Z"), "15.01.20");
+  assert.match(formatChatStamp(new Date().toISOString()), /^\d{2}:\d{2}$/);
+  const seen = ensureSeen(
+    [{ slug: "bote", last_at: "2026-10-30T10:00:00.000Z", count: 2 }],
+    {},
+    false,
+  );
+  assert.equal(seen.ready, true);
+  assert.equal(unreadCount({ slug: "bote", last_at: "2026-10-30T10:00:00.000Z", count: 2 }, seen.seen, true), 0);
+  assert.equal(
+    unreadCount({ slug: "bote", last_at: "2026-10-30T11:00:00.000Z", count: 4 }, seen.seen, true),
+    2,
+  );
+  assert.equal(unreadCount({ slug: "neu", last_at: "2026-10-30T11:00:00.000Z", count: 3 }, seen.seen, true), 3);
 });
 
 test("keysMatch hashes both sides and ignores length", async () => {
@@ -166,46 +191,81 @@ bot_name bleibt Text
   assert.match(renderMarkdown("> [!DANGER]\n> Gefahr"), /Gefahr/);
 });
 
-test("empty database seeds the welcome report and renders the dashboard", async () => {
+test("empty database seeds the welcome report and renders the chat office", async () => {
   const env = envWith();
   const page = await call(env, "/");
   assert.equal(page.status, 200);
   const html = await page.text();
-  assert.match(html, /<title>Willkommen im Grokbot Dashboard · Elon · Programmierer Smarthome<\/title>/);
-  assert.match(html, /property="og:title"/);
-  assert.match(html, /Grokbot Dashboard/);
-  assert.match(html, /Suche im Verlauf\.\.\./);
-  assert.match(html, /\+ Neu/);
-  assert.match(html, /Auto-Follow neuester Eintrag/);
-  assert.match(html, /Vollbild/);
-  assert.match(html, /Schrift kleiner/);
-  assert.match(html, /Schrift größer/);
-  assert.match(html, /Fokus \/ Vollbild/);
-  const article = articleOf(html);
+  assert.match(html, /<title>Grokbot Dashboard<\/title>/);
+  assert.match(html, /class="office route-home"/);
+  assert.match(html, /Bots suchen/);
+  assert.match(html, /Nur lesen/);
+  assert.match(html, /aria-label="Schrift kleiner"/);
+  assert.match(html, /aria-label="Schrift größer"/);
+  assert.match(html, /class="avatar/);
+  assert.match(html, /Elon/);
+  assert.match(html, /Programmierer Smarthome/);
+  assert.match(html, /<h1>Willkommen im Grokbot Dashboard<\/h1>/);
+  assert.match(html, /max-width:\s*860px/);
+  assert.match(html, /route-home #thread/);
+  assert.match(html, /route-chat #sidebar/);
+  const boot = bootFrom(html);
+  assert.equal(boot.mode, "office");
+  assert.equal(boot.explicit, false);
+  assert.equal(boot.selectedSlug, "elon-programmierer-smarthome");
+  assert.equal(boot.bots.length, 1);
+  assert.equal(boot.bots[0].display_name, "Elon · Programmierer Smarthome");
+  assert.equal(boot.bots[0].count, 1);
+  assert.equal(boot.messages[0].id, "willkommen");
+  assert.equal(boot.messages[0].content_md.includes("POST /api/results"), true);
+
+  const reader = await call(env, "/r/willkommen");
+  assert.equal(reader.status, 200);
+  const readerHtml = await reader.text();
+  assert.match(readerHtml, /<title>Willkommen im Grokbot Dashboard · Elon · Programmierer Smarthome<\/title>/);
+  assert.match(readerHtml, /property="og:title"/);
+  assert.match(readerHtml, /Suche im Verlauf\.\.\./);
+  assert.match(readerHtml, /\+ Neu/);
+  assert.match(readerHtml, /Auto-Follow neuester Eintrag/);
+  assert.match(readerHtml, /Vollbild/);
+  assert.match(readerHtml, /Fokus \/ Vollbild/);
+  assert.match(readerHtml, />Chat</);
+  const article = articleOf(readerHtml);
   assert.match(article, /<table>/);
   assert.match(article, /E-Mail-Verwalter/);
   assert.match(article, /Hey Grok, Bote soll mir eine Übersicht/);
   assert.match(article, /POST \/api\/results/);
   assert.match(article, /callout-note/);
   assert.match(article, /class="tasks"/);
-  const boot = bootFrom(html);
-  assert.equal(boot.result.id, "willkommen");
-  assert.equal(boot.result.bot_name, "Elon · Programmierer Smarthome");
-  assert.equal(boot.result.pinned, true);
-  assert.equal(boot.results[0].id, "willkommen");
-  assert.equal(boot.results[0].content_md, undefined);
+  const readerBoot = bootFrom(readerHtml);
+  assert.equal(readerBoot.result.id, "willkommen");
+  assert.equal(readerBoot.result.bot_name, "Elon · Programmierer Smarthome");
+  assert.equal(readerBoot.result.bot_slug, "elon-programmierer-smarthome");
+  assert.equal(readerBoot.result.pinned, true);
+  assert.equal(readerBoot.results[0].id, "willkommen");
+  assert.equal(readerBoot.results[0].content_md, undefined);
 
   const again = await json(await call(env, "/api/results"));
   assert.equal(again.results.length, 1);
+  assert.equal(again.results[0].bot_slug, "elon-programmierer-smarthome");
 
   const script = html.match(/<script>([\s\S]*?)<\/script>\s*<\/body>/)[1];
   new Function(script);
   const sandbox = {};
   vm.createContext(sandbox);
-  vm.runInContext(`${script.replace(/appMain\(\);\s*$/, "")}\nglobalThis.__render = renderMarkdown;`, sandbox);
+  vm.runInContext(
+    `${script.replace(/officeMain\(\);\s*$/, "")}\nglobalThis.__render = renderMarkdown;\nglobalThis.__unread = unreadCount;`,
+    sandbox,
+  );
   assert.match(sandbox.__render("**x**"), /<strong>x<\/strong>/);
+  assert.equal(sandbox.__unread({ slug: "a", count: 3, last_at: "2026-10-30T12:00:00.000Z" }, { a: { at: "2026-10-30T11:00:00.000Z", count: 1 } }, true), 2);
   assert.match(script, /POLL_MS = 8000/);
   assert.match(script, /Europe\/Berlin/);
+  assert.match(script, /gd-seen/);
+
+  const readerScript = readerHtml.match(/<script>([\s\S]*?)<\/script>\s*<\/body>/)[1];
+  new Function(readerScript);
+  assert.match(readerScript, /appMain\(\);/);
 });
 
 test("JSON, raw markdown, and multipart ingestion", async () => {
@@ -352,7 +412,11 @@ test("list filters, latest, raw, patch, delete, and dashboard routes", async () 
 
   const home = await call(env, "/");
   assert.equal(home.status, 200);
-  assert.equal(bootFrom(await home.text()).selectedId, "bote-mails");
+  const homeHtml = await home.text();
+  const homeBoot = bootFrom(homeHtml);
+  assert.equal(homeBoot.selectedSlug, "bote-e-mail-verwalter");
+  assert.equal(homeBoot.explicit, false);
+  assert.match(homeHtml, /Geheimwort Kürbis/);
   const pinnedView = await call(env, "/?id=willkommen");
   assert.equal(bootFrom(await pinnedView.text()).selectedId, "willkommen");
   const direct = await call(env, "/r/bote-mails");
@@ -433,6 +497,273 @@ test("API key protects writes only, and CORS preflight stays open", async () => 
   const head = await call(open, "/api/results", { method: "HEAD" });
   assert.equal(head.status, 200);
   assert.equal(await head.text(), "");
+});
+
+test("chat API stores messages, lists bots, and paginates history", async () => {
+  const env = envWith();
+  const user = await call(env, "/api/messages", {
+    method: "POST",
+    body: {
+      bot_name: "Bote · E-Mail-Verwalter",
+      role: "user",
+      content: "Fasse die letzten Mails zusammen.",
+      task: "posteingang",
+    },
+  });
+  assert.equal(user.status, 201);
+  const userBody = await json(user);
+  assert.equal(userBody.role, "user");
+  assert.equal(userBody.bot_slug, "bote-e-mail-verwalter");
+  assert.equal(userBody.chat_url, `${ORIGIN}/bot/bote-e-mail-verwalter`);
+  assert.equal(userBody.dashboard_url, `${ORIGIN}/?bot=bote-e-mail-verwalter`);
+  assert.equal(user.headers.get("location"), userBody.chat_url);
+
+  const bot = await call(env, "/api/bots/bote/messages", {
+    method: "POST",
+    headers: { "x-bot-name": "Bote · E-Mail-Verwalter", "x-category": "email" },
+    body: {
+      title: "Posteingang",
+      content: "# Posteingang\n\nDrei **neue** Mails.",
+      meta: { source: "gmail", n: 3 },
+    },
+  });
+  assert.equal(bot.status, 201);
+  const botBody = await json(bot);
+  assert.equal(botBody.bot_slug, "bote-e-mail-verwalter");
+  assert.equal(botBody.title, "Posteingang");
+
+  const raw = await call(env, "/api/bots/Planer%20%C2%B7%20Kalenderplaner/messages", {
+    method: "POST",
+    headers: { "content-type": "text/markdown", "x-title": "Morgen", "x-role": "bot" },
+    body: "# Morgen\n\nStandup um neun.",
+  });
+  assert.equal(raw.status, 201);
+  assert.equal((await json(raw)).bot_slug, "planer-kalenderplaner");
+
+  const mismatch = await call(env, "/api/bots/elon-programmierer-smarthome/messages", {
+    method: "POST",
+    body: { bot_name: "Bote · E-Mail-Verwalter", content: "Falscher Bot" },
+  });
+  assert.equal(mismatch.status, 400);
+
+  const missingName = await call(env, "/api/messages", { method: "POST", body: { content: "Ohne Namen" } });
+  assert.equal(missingName.status, 400);
+
+  const badRole = await call(env, "/api/messages", {
+    method: "POST",
+    body: { bot_name: "Bote · E-Mail-Verwalter", content: "x", role: "system" },
+  });
+  assert.equal(badRole.status, 400);
+
+  const bots = await json(await call(env, "/api/bots"));
+  const slugs = bots.bots.map((item) => item.slug);
+  assert.equal(slugs[0], "planer-kalenderplaner");
+  const bote = bots.bots.find((item) => item.slug === "bote-e-mail-verwalter");
+  assert.equal(bote.count, 2);
+  assert.equal(bote.display_name, "Bote · E-Mail-Verwalter");
+  assert.equal(bote.last_message.preview, "Posteingang");
+  assert.equal(bote.last_message.role, "bot");
+  assert.equal(bote.color, "#5b8cff");
+
+  const filtered = await json(await call(env, "/api/bots?q=plan"));
+  assert.deepEqual(filtered.bots.map((item) => item.slug), ["planer-kalenderplaner"]);
+
+  const history = await json(await call(env, "/api/bots/bote-e-mail-verwalter/messages?limit=1"));
+  assert.equal(history.messages.length, 1);
+  assert.equal(history.messages[0].id, botBody.id);
+  assert.equal(history.has_more, true);
+  assert.equal(history.bot.slug, "bote-e-mail-verwalter");
+  assert.deepEqual(history.messages[0].meta, { source: "gmail", n: 3 });
+  const older = await json(await call(
+    env,
+    `/api/bots/Bote/messages?limit=1&before=${encodeURIComponent(history.next_before)}&before_id=${encodeURIComponent(history.next_before_id)}`,
+  ));
+  assert.equal(older.messages.length, 1);
+  assert.equal(older.messages[0].id, userBody.id);
+  assert.equal(older.messages[0].role, "user");
+  assert.equal(older.has_more, false);
+
+  const viaResults = await json(await call(env, "/api/results?bot=Bote"));
+  assert.equal(viaResults.results.length, 2);
+
+  const office = await call(env, "/bot/bote-e-mail-verwalter");
+  assert.equal(office.status, 200);
+  const officeHtml = await office.text();
+  assert.match(officeHtml, /class="office route-chat"/);
+  assert.match(officeHtml, /Zurück/);
+  assert.match(officeHtml, /class="bubble role-user"/);
+  assert.match(officeHtml, /class="bubble role-bot"/);
+  assert.match(officeHtml, /<strong>neue<\/strong>/);
+  assert.match(officeHtml, new RegExp(`href="/r/${botBody.id}"`));
+  assert.equal(bootFrom(officeHtml).explicit, true);
+
+  const queryLink = await call(env, "/?bot=Elon");
+  assert.equal(queryLink.status, 200);
+  const queryHtml = await queryLink.text();
+  assert.equal(bootFrom(queryHtml).selectedSlug, "elon-programmierer-smarthome");
+  assert.match(queryHtml, /class="office route-chat"/);
+
+  const short = await call(env, "/bot/planer");
+  assert.equal(short.status, 200);
+  assert.equal(bootFrom(await short.text()).selectedSlug, "planer-kalenderplaner");
+
+  const missingBot = await call(env, "/bot/nicht-da");
+  assert.equal(missingBot.status, 404);
+  assert.match(await missingBot.text(), /Dieser Bot ist nicht im Dashboard/);
+  assert.equal((await call(env, "/api/bots/nicht-da/messages")).status, 404);
+
+  const badCursor = await call(env, "/api/bots/bote/messages?before=gestern");
+  assert.equal(badCursor.status, 400);
+});
+
+test("bot registry keeps a custom name and avatar", async () => {
+  const env = envWith();
+  await call(env, "/api/results", {
+    method: "POST",
+    body: { bot_name: "Bote · E-Mail-Verwalter", content: "# Alt\n\nVorher." },
+  });
+  const created = await call(env, "/api/bots/bote-e-mail-verwalter", {
+    method: "PUT",
+    body: {
+      display_name: "Bote",
+      emoji: "✉️",
+      color: "#112233",
+      description: "Posteingang",
+    },
+  });
+  assert.equal(created.status, 200);
+  const createdBody = await json(created);
+  assert.equal(createdBody.bot.display_name, "Bote");
+  assert.equal(createdBody.bot.emoji, "✉️");
+  assert.equal(createdBody.bot.color, "#112233");
+  assert.equal(createdBody.bot.description, "Posteingang");
+
+  await call(env, "/api/messages", {
+    method: "POST",
+    body: { bot_name: "Bote · E-Mail-Verwalter", content: "Nach dem Umbenennen." },
+  });
+  const again = await json(await call(env, "/api/bots/bote"));
+  assert.equal(again.bot.display_name, "Bote");
+  assert.equal(again.bot.emoji, "✉️");
+  assert.equal(again.bot.count, 2);
+
+  const fresh = await call(env, "/api/bots/reiseleiter", {
+    method: "PUT",
+    body: { display_name: "Reiseleiter", color: "red" },
+  });
+  assert.equal(fresh.status, 400);
+  const okFresh = await call(env, "/api/bots/reiseleiter", {
+    method: "PUT",
+    body: { display_name: "Reiseleiter", description: "Unterwegs" },
+  });
+  assert.equal(okFresh.status, 201);
+  const listed = await json(await call(env, "/api/bots"));
+  const trip = listed.bots.find((item) => item.slug === "reiseleiter");
+  assert.equal(trip.display_name, "Reiseleiter");
+  assert.equal(trip.count, 0);
+  assert.equal(trip.last_message, null);
+
+  const twinA = await call(env, "/api/messages", {
+    method: "POST",
+    body: { bot_name: "Bote · Alpha", content: "A" },
+  });
+  assert.equal(twinA.status, 201);
+  await call(env, "/api/messages", {
+    method: "POST",
+    body: { bot_name: "Bote · Beta", content: "B" },
+  });
+  const ambiguous = await call(env, "/api/bots/bote/messages");
+  assert.equal(ambiguous.status, 409);
+  const exact = await json(await call(env, "/api/bots/bote-alpha/messages"));
+  assert.equal(exact.messages.length, 1);
+});
+
+test("writes stay open unless DASHBOARD_API_KEY is set", async () => {
+  const locked = envWith({ DASHBOARD_API_KEY: "top-secret" });
+  assert.equal((await call(locked, "/api/messages", { method: "POST", body: { bot_name: "Chef", content: "Nein" } })).status, 401);
+  assert.equal((await call(locked, "/api/bots/chef", { method: "PUT", body: { display_name: "Chef" } })).status, 401);
+  const allowed = await call(locked, "/api/bots/chef/messages", {
+    method: "POST",
+    headers: { authorization: "Bearer top-secret" },
+    body: { bot_name: "Chef · Admin", content: "# Freigabe\n\nOk." },
+  });
+  assert.equal(allowed.status, 201);
+  assert.equal((await call(locked, "/api/bots")).status, 200);
+  const preflight = await call(locked, "/api/messages", { method: "OPTIONS" });
+  assert.match(preflight.headers.get("access-control-allow-headers"), /X-Role/);
+});
+
+test("legacy results migrate into bot histories without exec()", async () => {
+  const raw = createRawDb();
+  raw.exec(`CREATE TABLE results (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    bot_name TEXT NOT NULL DEFAULT 'Grokbot',
+    bot_id TEXT DEFAULT '',
+    category TEXT DEFAULT 'general',
+    summary TEXT DEFAULT '',
+    content_md TEXT NOT NULL,
+    pinned INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`);
+  raw.prepare(`INSERT INTO results (
+    id, title, bot_name, bot_id, category, summary, content_md, pinned, created_at, updated_at
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    "alt-bericht",
+    "Alter Bericht",
+    "Bote · E-Mail-Verwalter",
+    "",
+    "email",
+    "Kurz",
+    "# Alter Bericht\n\nSchon da.",
+    0,
+    "2026-10-01T10:00:00.000Z",
+    "2026-10-01T10:00:00.000Z",
+  );
+  let execCalls = 0;
+  const firstEnv = {
+    DB: adaptDb(raw),
+  };
+  firstEnv.DB.exec = async () => {
+    execCalls += 1;
+    throw new Error("exec should not be used");
+  };
+  const bots = await json(await call(firstEnv, "/api/bots"));
+  assert.equal(execCalls, 0);
+  assert.equal(bots.bots.length, 1);
+  assert.equal(bots.bots[0].slug, "bote-e-mail-verwalter");
+  assert.equal(bots.bots[0].count, 1);
+  assert.equal(bots.bots[0].last_message.id, "alt-bericht");
+  const page = await call(firstEnv, "/r/alt-bericht");
+  assert.equal(page.status, 200);
+  assert.match(await page.text(), /Schon da/);
+
+  const second = { DB: adaptDb(raw) };
+  second.DB.exec = async () => {
+    execCalls += 1;
+    throw new Error("exec should not be used");
+  };
+  const again = await json(await call(second, "/api/bots"));
+  assert.equal(execCalls, 0);
+  assert.equal(again.bots.length, 1);
+  assert.equal(again.bots[0].count, 1);
+  const columns = raw.prepare("PRAGMA table_info(results)").all().map((row) => row.name);
+  for (const name of ["role", "task", "meta", "bot_slug"]) assert.equal(columns.includes(name), true);
+});
+
+test("bot names are escaped in the office shell", async () => {
+  const env = envWith();
+  await call(env, "/api/messages", {
+    method: "POST",
+    body: { bot_name: "Bote <script>", content: "Hallo <script>alert(1)</script>" },
+  });
+  const html = await (await call(env, "/")).text();
+  assert.equal(/<script>alert/i.test(html), false);
+  assert.match(html, /Bote &lt;script&gt;/);
+  assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  const boot = bootFrom(html);
+  assert.equal(boot.bots[0].display_name, "Bote <script>");
 });
 
 test("unknown API routes and unsupported media types fail clearly", async () => {

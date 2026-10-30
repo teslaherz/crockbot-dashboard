@@ -6,8 +6,12 @@
 const MAX_MARKDOWN = 500_000;
 const MAX_BODY = 600_000;
 const DEFAULT_LIMIT = 200;
+const DEFAULT_MESSAGE_LIMIT = 50;
+const MAX_MESSAGE_LIMIT = 200;
 
-const CREATE_TABLE_SQL = `CREATE TABLE IF NOT EXISTS results (
+// One statement per prepare().run(). D1 exec() rejects or drops multi-statement
+// scripts on the production database, so startup never batches SQL.
+const RESULTS_TABLE_SQL = `CREATE TABLE IF NOT EXISTS results (
   id TEXT PRIMARY KEY,
   title TEXT NOT NULL,
   bot_name TEXT NOT NULL DEFAULT 'Grokbot',
@@ -17,16 +21,41 @@ const CREATE_TABLE_SQL = `CREATE TABLE IF NOT EXISTS results (
   content_md TEXT NOT NULL,
   pinned INTEGER DEFAULT 0,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);`;
+  updated_at TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'bot',
+  task TEXT DEFAULT '',
+  meta TEXT DEFAULT '',
+  bot_slug TEXT DEFAULT ''
+)`;
 
-const CREATE_INDEXES_SQL = `CREATE INDEX IF NOT EXISTS idx_results_pinned_created ON results (pinned DESC, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_results_bot ON results (bot_name);`;
+const BOTS_TABLE_SQL = `CREATE TABLE IF NOT EXISTS bots (
+  slug TEXT PRIMARY KEY,
+  display_name TEXT NOT NULL,
+  emoji TEXT DEFAULT '',
+  color TEXT DEFAULT '',
+  description TEXT DEFAULT '',
+  customized INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+)`;
+
+const INDEX_SQL = [
+  `CREATE INDEX IF NOT EXISTS idx_results_pinned_created ON results (pinned DESC, created_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_results_bot ON results (bot_name)`,
+  `CREATE INDEX IF NOT EXISTS idx_results_bot_slug_created ON results (bot_slug, created_at DESC, id DESC)`,
+];
+
+const RESULT_ADD_COLUMNS = [
+  ["role", "TEXT NOT NULL DEFAULT 'bot'"],
+  ["task", "TEXT DEFAULT ''"],
+  ["meta", "TEXT DEFAULT ''"],
+  ["bot_slug", "TEXT DEFAULT ''"],
+];
 
 const CORS_HEADERS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-  "access-control-allow-headers": "Content-Type, Authorization, X-API-Key, X-Title, X-Bot-Name, X-Bot-Id, X-Category",
+  "access-control-allow-headers": "Content-Type, Authorization, X-API-Key, X-Title, X-Bot-Name, X-Bot-Id, X-Category, X-Role, X-Task",
   "access-control-max-age": "86400",
 };
 
@@ -232,6 +261,23 @@ function normalizeId(input) {
   return text;
 }
 
+function botSlug(name) {
+  return normalizeId(name);
+}
+
+function shortSlug(name) {
+  const short = String(name || "").split("·")[0];
+  return botSlug(short);
+}
+
+function decodePath(raw) {
+  try {
+    return decodeURIComponent(String(raw ?? ""));
+  } catch (error) {
+    return "";
+  }
+}
+
 function parseRouteId(raw) {
   let text = String(raw ?? "");
   try {
@@ -271,11 +317,11 @@ function parsePinned(value, fallback = 0) {
   return null;
 }
 
-function clampLimit(raw) {
-  if (raw == null || raw === "") return DEFAULT_LIMIT;
+function clampLimit(raw, fallback = DEFAULT_LIMIT, max = 500) {
+  if (raw == null || raw === "") return fallback;
   const value = Number(raw);
-  if (!Number.isFinite(value) || value <= 0) return DEFAULT_LIMIT;
-  return Math.min(500, Math.floor(value));
+  if (!Number.isFinite(value) || value <= 0) return fallback;
+  return Math.min(max, Math.floor(value));
 }
 
 function berlinParts(date) {
@@ -313,6 +359,37 @@ function formatFullStamp(iso) {
   if (Number.isNaN(date.getTime())) return "";
   const parts = berlinParts(date);
   return `${parts.d}.${parts.m}.${parts.y}, ${parts.hh}:${parts.mm} Uhr`;
+}
+
+function berlinDayNumber(date) {
+  const parts = berlinParts(date);
+  return Math.floor(Date.UTC(Number(parts.y), Number(parts.m) - 1, Number(parts.d)) / 86400000);
+}
+
+function berlinWeekdayShort(date) {
+  const parts = berlinParts(date);
+  const noon = new Date(Date.UTC(Number(parts.y), Number(parts.m) - 1, Number(parts.d), 12, 0, 0));
+  return ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"][noon.getUTCDay()] || "";
+}
+
+function formatChatStamp(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  const parts = berlinParts(date);
+  const clock = `${parts.hh}:${parts.mm}`;
+  const diff = berlinDayNumber(new Date()) - berlinDayNumber(date);
+  if (diff === 0) return clock;
+  if (diff === 1) return "Gestern";
+  if (diff > 1 && diff < 7) return berlinWeekdayShort(date);
+  if (parts.y === berlinParts(new Date()).y) return `${parts.d}.${parts.m}.`;
+  return `${parts.d}.${parts.m}.${parts.y.slice(2)}`;
+}
+
+function formatBubbleClock(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  const parts = berlinParts(date);
+  return `${parts.hh}:${parts.mm}`;
 }
 
 function formatListStamp(iso) {
@@ -373,6 +450,31 @@ function makeSummary(markdown) {
   const cut = text.slice(0, 180);
   const space = cut.lastIndexOf(" ");
   return `${(space > 80 ? cut.slice(0, space) : cut).trim()}…`;
+}
+
+function messagePreview(markdown) {
+  const lines = String(markdown ?? "").replace(/\r\n?/g, "\n").split("\n");
+  let fence = false;
+  for (let line of lines) {
+    if (/^\s{0,3}(```+|~~~+)/.test(line)) {
+      fence = !fence;
+      continue;
+    }
+    if (fence) continue;
+    line = line.replace(/^\s{0,3}#{1,6}\s+/, "");
+    line = line.replace(/^\s{0,3}>\s?/, "");
+    line = line.replace(/^\s*[-*+]\s+\[[ xX]]\s+/, "");
+    line = line.replace(/^\s*([-*+]|\d+[.)])\s+/, "");
+    line = line.replace(/!\[[^\]]*]\([^)]*\)/g, "");
+    line = line.replace(/\[([^\]]+)]\([^)]*\)/g, "$1");
+    line = line.replace(/\[!(?:NOTE|TIP|IMPORTANT|WARNING|CAUTION|DANGER|ERROR)\]/gi, "");
+    line = line.replace(/[`*_~]/g, "");
+    line = line.replace(/\s+/g, " ").trim();
+    if (!line) continue;
+    if (line.length <= 90) return line;
+    return `${line.slice(0, 87).trim()}…`;
+  }
+  return "";
 }
 
 function filenameStem(name) {
@@ -438,8 +540,51 @@ async function run(db, sql, params = []) {
   return { changes: Number(changes) || 0 };
 }
 
+async function touchBot(db, slug, displayName) {
+  const name = cleanText(displayName, 120) || slug;
+  const nameSlug = botSlug(name) || slug;
+  const now = nowIso();
+  const existing = await first(db, "SELECT slug, display_name, customized FROM bots WHERE slug = ?", [slug]);
+  if (!existing) {
+    try {
+      await run(
+        db,
+        `INSERT INTO bots (slug, display_name, emoji, color, description, customized, created_at, updated_at)
+         VALUES (?, ?, '', '', '', 0, ?, ?)`,
+        [slug, name, now, now],
+      );
+    } catch (error) {
+      if (!/unique/i.test(String(error?.message || ""))) throw error;
+    }
+    return;
+  }
+  if (Number(existing.customized) === 1) return;
+  if (nameSlug !== slug) return;
+  if (existing.display_name === name) return;
+  await run(
+    db,
+    "UPDATE bots SET display_name = ?, updated_at = ? WHERE slug = ? AND customized = 0",
+    [name, now, slug],
+  );
+}
+
+async function backfillBots(db) {
+  const missing = await all(db, "SELECT id, bot_name FROM results WHERE bot_slug IS NULL OR bot_slug = ''");
+  for (const row of missing) {
+    const slug = botSlug(row.bot_name) || "grokbot";
+    await run(db, "UPDATE results SET bot_slug = ? WHERE id = ?", [slug, row.id]);
+  }
+  const pairs = await all(
+    db,
+    "SELECT bot_slug AS slug, MIN(bot_name) AS bot_name FROM results WHERE bot_slug != '' GROUP BY bot_slug",
+  );
+  for (const row of pairs) {
+    await touchBot(db, row.slug, row.bot_name);
+  }
+}
+
 function ensureReady(env) {
-  if (!env?.DB || typeof env.DB.prepare !== "function" || typeof env.DB.exec !== "function") {
+  if (!env?.DB || typeof env.DB.prepare !== "function") {
     throw httpError(500, "D1 binding DB is not configured", { expose: true });
   }
   let pending = readyDatabases.get(env.DB);
@@ -453,30 +598,69 @@ function ensureReady(env) {
   return pending;
 }
 
-async function initDatabase(env) {
-  await env.DB.exec(CREATE_TABLE_SQL);
-  try {
-    await env.DB.exec(CREATE_INDEXES_SQL);
-  } catch (error) {
-    logEvent("error", "schema.index_failed", { message: error?.message || "index failed" });
+async function applySql(db, sql) {
+  await db.prepare(sql).run();
+}
+
+async function tableColumnSet(db, table) {
+  if (table !== "results" && table !== "bots") throw new Error("Unexpected table");
+  const rows = await all(db, `PRAGMA table_info(${table})`);
+  return new Set(rows.map((row) => String(row.name || "")));
+}
+
+async function ensureResultColumns(db) {
+  const have = await tableColumnSet(db, "results");
+  const added = [];
+  for (const [name, definition] of RESULT_ADD_COLUMNS) {
+    if (have.has(name)) continue;
+    try {
+      await applySql(db, `ALTER TABLE results ADD COLUMN ${name} ${definition}`);
+      have.add(name);
+      added.push(name);
+    } catch (error) {
+      const message = String(error?.message || "");
+      if (/duplicate column/i.test(message)) {
+        have.add(name);
+        continue;
+      }
+      throw error;
+    }
   }
-  const row = await first(env.DB, "SELECT COUNT(*) AS n FROM results");
+  return added;
+}
+
+async function initDatabase(env) {
+  const db = env.DB;
+  await applySql(db, RESULTS_TABLE_SQL);
+  const added = await ensureResultColumns(db);
+  for (const sql of INDEX_SQL) {
+    try {
+      await applySql(db, sql);
+    } catch (error) {
+      logEvent("error", "schema.index_failed", { message: error?.message || "index failed" });
+    }
+  }
+  await applySql(db, BOTS_TABLE_SQL);
+  await backfillBots(db);
+  const row = await first(db, "SELECT COUNT(*) AS n FROM results");
   if (Number(row?.n || 0) === 0) {
-    await insertWelcome(env.DB);
-    logEvent("info", "schema.ready", { seeded: true });
+    await insertWelcome(db);
+    logEvent("info", "schema.ready", { seeded: true, added_columns: added });
     return;
   }
-  logEvent("info", "schema.ready", { seeded: false });
+  logEvent("info", "schema.ready", { seeded: false, added_columns: added });
 }
 
 async function insertWelcome(db) {
   const now = nowIso();
   const summary = makeSummary(WELCOME_MD);
+  const slug = botSlug("Elon · Programmierer Smarthome") || "grokbot";
   await run(
     db,
     `INSERT OR IGNORE INTO results (
-      id, title, bot_name, bot_id, category, summary, content_md, pinned, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      id, title, bot_name, bot_id, category, summary, content_md, pinned, created_at, updated_at,
+      role, task, meta, bot_slug
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'bot', '', '', ?)`,
     [
       "willkommen",
       "Willkommen im Grokbot Dashboard",
@@ -488,27 +672,50 @@ async function insertWelcome(db) {
       1,
       now,
       now,
+      slug,
     ],
   );
+  await touchBot(db, slug, "Elon · Programmierer Smarthome");
+}
+
+function parseMeta(value) {
+  if (value == null || value === "") return null;
+  const text = String(value);
+  if (text.startsWith("{") || text.startsWith("[")) {
+    try {
+      return JSON.parse(text);
+    } catch (error) {
+      return text;
+    }
+  }
+  return text;
 }
 
 function present(row, origin, { full = false } = {}) {
   const id = row.id;
+  const slug = row.bot_slug || "";
   const item = {
     id,
     title: row.title,
     bot_name: row.bot_name,
     bot_id: row.bot_id || "",
+    bot_slug: slug,
     category: row.category || "general",
     summary: row.summary || "",
+    role: row.role || "bot",
+    task: row.task || "",
     pinned: Number(row.pinned) === 1,
     created_at: row.created_at,
     updated_at: row.updated_at,
     url: `${origin}/r/${encodeURIComponent(id)}`,
     dashboard_url: `${origin}/?id=${encodeURIComponent(id)}`,
+    chat_url: slug ? `${origin}/bot/${encodeURIComponent(slug)}` : `${origin}/`,
     raw_url: `${origin}/api/results/${encodeURIComponent(id)}/raw`,
   };
-  if (full) item.content_md = row.content_md;
+  if (full) {
+    item.content_md = row.content_md;
+    item.meta = parseMeta(row.meta);
+  }
   return item;
 }
 
@@ -537,8 +744,8 @@ function buildFilters(filters = {}) {
 async function queryResults(db, filters = {}) {
   const { where, params } = buildFilters(filters);
   const cols = filters.full
-    ? "id, title, bot_name, bot_id, category, summary, content_md, pinned, created_at, updated_at"
-    : "id, title, bot_name, bot_id, category, summary, pinned, created_at, updated_at";
+    ? "id, title, bot_name, bot_id, bot_slug, category, summary, content_md, role, task, meta, pinned, created_at, updated_at"
+    : "id, title, bot_name, bot_id, bot_slug, category, summary, role, task, pinned, created_at, updated_at";
   let sql = `SELECT ${cols} FROM results`;
   if (where.length) sql += ` WHERE ${where.join(" AND ")}`;
   sql += " ORDER BY pinned DESC, created_at DESC, rowid DESC LIMIT ?";
@@ -618,6 +825,8 @@ function queryMeta(url) {
     id: url.searchParams.get("id"),
     summary: url.searchParams.get("summary"),
     pinned: url.searchParams.get("pinned"),
+    role: url.searchParams.get("role"),
+    task: url.searchParams.get("task"),
   };
 }
 
@@ -627,6 +836,8 @@ function headerMeta(request) {
     botName: request.headers.get("x-bot-name"),
     botId: request.headers.get("x-bot-id"),
     category: request.headers.get("x-category"),
+    role: request.headers.get("x-role"),
+    task: request.headers.get("x-task"),
   };
 }
 
@@ -697,6 +908,9 @@ async function readMultipart(request, query, headers) {
     summary: firstString(form.get("summary"), query.summary),
     id: firstString(form.get("id"), query.id),
     pinned: firstString(form.get("pinned"), query.pinned),
+    role: firstString(form.get("role"), query.role, headers.role),
+    task: firstString(form.get("task"), query.task, headers.task),
+    meta: form.get("meta"),
   };
 }
 
@@ -731,6 +945,9 @@ async function readPayload(request) {
       summary: firstString(data.summary, query.summary),
       id: firstString(data.id, query.id),
       pinned: data.pinned != null && data.pinned !== "" ? data.pinned : query.pinned,
+      role: firstString(data.role, query.role, headers.role),
+      task: firstString(data.task, query.task, headers.task),
+      meta: data.meta !== undefined ? data.meta : undefined,
     };
   }
   if (type && !forceRaw && type !== "application/octet-stream" && type !== "application/x-www-form-urlencoded") {
@@ -750,6 +967,104 @@ function rawDocument(raw, query, headers) {
     summary: firstString(query.summary),
     id: firstString(query.id),
     pinned: query.pinned,
+    role: firstString(query.role, headers.role),
+    task: firstString(query.task, headers.task),
+    meta: undefined,
+  };
+}
+
+function cleanRole(value) {
+  const role = String(value || "").trim().toLowerCase();
+  if (!role) return "bot";
+  if (role === "bot" || role === "user") return role;
+  throw httpError(400, "Invalid role");
+}
+
+function cleanMeta(value) {
+  if (value == null || value === "") return "";
+  let text = "";
+  if (typeof value === "string") text = value;
+  else if (typeof value === "object") {
+    try {
+      text = JSON.stringify(value);
+    } catch (error) {
+      throw httpError(400, "Invalid meta");
+    }
+  } else {
+    throw httpError(400, "Invalid meta");
+  }
+  if (text.length > 8000) throw httpError(413, "Meta exceeds 8000 characters");
+  return text;
+}
+
+function cleanEmoji(value) {
+  const text = String(value ?? "").replace(/[\u0000-\u001F\u007F]/g, "").trim();
+  if (!text) return "";
+  if (text.length > 16 || /[<>&]/.test(text)) throw httpError(400, "Invalid emoji");
+  return text;
+}
+
+function cleanColor(value) {
+  if (value == null || String(value).trim() === "") return "";
+  const text = String(value).trim();
+  if (!/^#[0-9a-fA-F]{6}$/.test(text)) throw httpError(400, "Invalid color");
+  return text.toLowerCase();
+}
+
+async function persistResult(db, draft) {
+  const explicit = Boolean(draft.explicitId);
+  let id = draft.explicitId || "";
+  if (explicit) {
+    const existing = await getRow(db, id);
+    if (existing) throw httpError(409, "ID already exists");
+  }
+  const slug = draft.botSlug || botSlug(draft.botName) || "grokbot";
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const candidate = explicit ? id : generateId(new Date(draft.createdAt));
+    try {
+      await run(
+        db,
+        `INSERT INTO results (
+          id, title, bot_name, bot_id, category, summary, content_md, pinned, created_at, updated_at,
+          role, task, meta, bot_slug
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          candidate,
+          draft.title,
+          draft.botName,
+          draft.botId,
+          draft.category,
+          draft.summary,
+          draft.markdown,
+          draft.pinned,
+          draft.createdAt,
+          draft.createdAt,
+          draft.role || "bot",
+          draft.task || "",
+          draft.meta || "",
+          slug,
+        ],
+      );
+      await touchBot(db, slug, draft.botName);
+      return { id: candidate, botSlug: slug };
+    } catch (error) {
+      if (error?.status) throw error;
+      const message = String(error?.message || "");
+      if (!/unique/i.test(message)) throw error;
+      if (explicit) throw httpError(409, "ID already exists");
+      if (attempt === 4) throw httpError(500, "Could not allocate id", { expose: true });
+    }
+  }
+  throw httpError(500, "Could not allocate id", { expose: true });
+}
+
+function storedLinks(origin, id, slug) {
+  const url = `${origin}/r/${encodeURIComponent(id)}`;
+  return {
+    url,
+    dashboard_url: `${origin}/?id=${encodeURIComponent(id)}`,
+    chat_url: `${origin}/bot/${encodeURIComponent(slug)}`,
+    raw_url: `${origin}/api/results/${encodeURIComponent(id)}/raw`,
   };
 }
 
@@ -759,7 +1074,6 @@ async function createResult(request, env) {
   const markdown = cleanMarkdown(payload.markdown);
   if (!markdown) return json({ ok: false, error: "Markdown content is required" }, 400);
   const createdAt = nowIso();
-  const now = new Date(createdAt);
   const title = cleanText(payload.title, 200)
     || cleanText(extractTitle(markdown), 200)
     || cleanText(payload.filename, 200)
@@ -770,50 +1084,45 @@ async function createResult(request, env) {
   const summary = cleanText(payload.summary, 400) || makeSummary(markdown);
   const pinnedValue = parsePinned(payload.pinned, 0);
   if (pinnedValue == null) return json({ ok: false, error: "Invalid pinned value" }, 400);
-  const explicit = Boolean(payload.id);
-  let id = "";
-  if (explicit) {
-    id = normalizeId(payload.id);
-    if (!id) return json({ ok: false, error: "Invalid id" }, 400);
-    const existing = await getRow(env.DB, id);
-    if (existing) return json({ ok: false, error: "ID already exists" }, 409);
+  let explicitId = "";
+  if (payload.id) {
+    explicitId = normalizeId(payload.id);
+    if (!explicitId) return json({ ok: false, error: "Invalid id" }, 400);
   }
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const candidate = explicit ? id : generateId(now);
-    try {
-      await run(
-        env.DB,
-        `INSERT INTO results (
-          id, title, bot_name, bot_id, category, summary, content_md, pinned, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [candidate, title, botName, botId, category, summary, markdown, pinnedValue, createdAt, createdAt],
-      );
-      id = candidate;
-      break;
-    } catch (error) {
-      const message = String(error?.message || "");
-      if (!/unique/i.test(message)) throw error;
-      if (explicit) return json({ ok: false, error: "ID already exists" }, 409);
-      if (attempt === 4) throw httpError(500, "Could not allocate id", { expose: true });
-    }
-  }
+  const stored = await persistResult(env.DB, {
+    explicitId,
+    createdAt,
+    title,
+    botName,
+    botId,
+    category,
+    summary,
+    markdown,
+    pinned: pinnedValue,
+    role: "bot",
+    task: "",
+    meta: "",
+    botSlug: botSlug(botName) || "grokbot",
+  });
   const origin = originOf(request);
-  const url = `${origin}/r/${encodeURIComponent(id)}`;
-  logEvent("info", "result.created", { id, bot_name: botName, bytes: markdown.length });
+  const links = storedLinks(origin, stored.id, stored.botSlug);
+  logEvent("info", "result.created", { id: stored.id, bot_name: botName, bot_slug: stored.botSlug, bytes: markdown.length });
   return json(
     {
       ok: true,
-      id,
+      id: stored.id,
       title,
       bot_name: botName,
+      bot_slug: stored.botSlug,
       summary,
       created_at: createdAt,
-      url,
-      dashboard_url: `${origin}/?id=${encodeURIComponent(id)}`,
-      raw_url: `${origin}/api/results/${encodeURIComponent(id)}/raw`,
+      url: links.url,
+      dashboard_url: links.dashboard_url,
+      chat_url: links.chat_url,
+      raw_url: links.raw_url,
     },
     201,
-    { location: url },
+    { location: links.url },
   );
 }
 
@@ -850,6 +1159,8 @@ async function updateResult(request, env, id) {
   const pinned = patchValue(data, ["pinned"]);
   const summary = patchValue(data, ["summary"]);
   let nextMarkdown = existing.content_md;
+  let nextBotName = "";
+  let nextBotSlug = "";
 
   if (title.present) {
     const value = cleanText(title.value, 200);
@@ -865,8 +1176,12 @@ async function updateResult(request, env, id) {
   }
   if (bot.present) {
     const value = cleanText(bot.value, 120) || "Grokbot";
+    nextBotName = value;
+    nextBotSlug = botSlug(value) || "grokbot";
     sets.push("bot_name = ?");
     params.push(value);
+    sets.push("bot_slug = ?");
+    params.push(nextBotSlug);
   }
   if (category.present) {
     const value = cleanText(category.value, 60) || "general";
@@ -891,6 +1206,7 @@ async function updateResult(request, env, id) {
   sets.push("updated_at = ?");
   params.push(updatedAt, parsed);
   await run(env.DB, `UPDATE results SET ${sets.join(", ")} WHERE id = ?`, params);
+  if (nextBotSlug) await touchBot(env.DB, nextBotSlug, nextBotName);
   const row = await getRow(env.DB, parsed);
   logEvent("info", "result.updated", { id: parsed });
   return json({ ok: true, ...present(row, originOf(request), { full: true }) });
@@ -905,6 +1221,331 @@ async function deleteResult(request, env, id) {
   await run(env.DB, "DELETE FROM results WHERE id = ?", [parsed]);
   logEvent("info", "result.deleted", { id: parsed });
   return json({ ok: true, id: parsed });
+}
+
+async function readJsonBody(request) {
+  const type = mediaType(request);
+  if (type && type !== "application/json") throw httpError(415, "JSON body required");
+  let data;
+  try {
+    data = JSON.parse((await readLimitedText(request, 100_000)) || "null");
+  } catch (error) {
+    if (error?.status) throw error;
+    throw httpError(400, "Invalid JSON");
+  }
+  if (!data || typeof data !== "object" || Array.isArray(data)) throw httpError(400, "JSON body must be an object");
+  return data;
+}
+
+async function findBot(db, param) {
+  const decoded = decodePath(param).trim();
+  if (!decoded) return { bot: null, ambiguous: false };
+  const slug = botSlug(decoded);
+  if (slug) {
+    const exact = await first(db, "SELECT * FROM bots WHERE slug = ?", [slug]);
+    if (exact) return { bot: exact, ambiguous: false };
+  }
+  const wanted = decoded.toLowerCase();
+  const rows = await all(db, "SELECT * FROM bots ORDER BY slug");
+  const matches = rows.filter((row) => {
+    const name = String(row.display_name || "").trim().toLowerCase();
+    const short = name.split("·")[0].trim();
+    if (name === wanted || short === wanted) return true;
+    if (slug && (shortSlug(row.display_name) === slug || botSlug(row.display_name) === slug)) return true;
+    return false;
+  });
+  if (matches.length === 1) return { bot: matches[0], ambiguous: false };
+  if (matches.length > 1) return { bot: null, ambiguous: true };
+  return { bot: null, ambiguous: false };
+}
+
+async function resolveMessageBot(db, urlParam, botNameRaw) {
+  const botName = cleanText(botNameRaw, 120);
+  const nameSlug = botName ? botSlug(botName) || "" : "";
+  if (urlParam) {
+    const found = await findBot(db, urlParam);
+    if (found.ambiguous) throw httpError(409, "Ambiguous bot");
+    if (found.bot) {
+      if (botName) {
+        const same = nameSlug === found.bot.slug
+          || shortSlug(botName) === shortSlug(found.bot.display_name)
+          || nameSlug === shortSlug(found.bot.display_name);
+        if (!same) throw httpError(400, "bot_name does not match the bot in the URL");
+      }
+      return { slug: found.bot.slug, displayName: botName || found.bot.display_name };
+    }
+    const urlSlug = botSlug(decodePath(urlParam));
+    if (!urlSlug) throw httpError(400, "Invalid bot");
+    if (botName) {
+      if (urlSlug !== nameSlug && urlSlug !== shortSlug(botName)) {
+        throw httpError(400, "bot_name does not match the bot in the URL");
+      }
+      return { slug: nameSlug || urlSlug, displayName: botName };
+    }
+    const decoded = cleanText(decodePath(urlParam), 120) || urlSlug;
+    return { slug: urlSlug, displayName: decoded };
+  }
+  if (!botName || !nameSlug) throw httpError(400, "bot_name is required");
+  return { slug: nameSlug, displayName: botName };
+}
+
+function publicColor(row) {
+  const stored = String(row?.color || "");
+  if (/^#[0-9a-fA-F]{6}$/.test(stored)) return stored.toLowerCase();
+  return botProfile(row?.display_name || row?.slug || "Grokbot").color;
+}
+
+function publicBot(row, stats, origin) {
+  const slug = row.slug;
+  const last = stats?.last || null;
+  return {
+    slug,
+    display_name: row.display_name,
+    emoji: row.emoji || "",
+    color: publicColor(row),
+    description: row.description || "",
+    count: Number(stats?.count || 0),
+    last_at: stats?.lastAt || null,
+    last_message: last
+      ? {
+          id: last.id,
+          preview: messagePreview(last.content_md) || last.title || "",
+          title: last.title || "",
+          role: last.role || "bot",
+          category: last.category || "general",
+          created_at: last.created_at,
+        }
+      : null,
+    url: `${origin}/bot/${encodeURIComponent(slug)}`,
+  };
+}
+
+async function assembleBots(db, origin) {
+  const registry = await all(db, "SELECT * FROM bots");
+  const counts = await all(
+    db,
+    "SELECT bot_slug AS slug, COUNT(*) AS n, MAX(created_at) AS last_at FROM results WHERE bot_slug != '' GROUP BY bot_slug",
+  );
+  const latests = await all(
+    db,
+    `SELECT id, title, content_md, created_at, role, category, bot_slug
+     FROM (
+       SELECT id, title, content_md, created_at, role, category, bot_slug,
+              ROW_NUMBER() OVER (PARTITION BY bot_slug ORDER BY created_at DESC, id DESC) AS rn
+       FROM results
+       WHERE bot_slug != ''
+     )
+     WHERE rn = 1`,
+  );
+  const countBy = new Map(counts.map((row) => [row.slug, row]));
+  const latestBy = new Map(latests.map((row) => [row.bot_slug, row]));
+  const bots = registry.map((row) => {
+    const countRow = countBy.get(row.slug);
+    return publicBot(row, {
+      count: countRow?.n || 0,
+      lastAt: countRow?.last_at || null,
+      last: latestBy.get(row.slug) || null,
+    }, origin);
+  });
+  bots.sort((a, b) => {
+    if (!a.last_at && !b.last_at) return a.display_name.localeCompare(b.display_name, "de");
+    if (!a.last_at) return 1;
+    if (!b.last_at) return -1;
+    if (a.last_at === b.last_at) return a.display_name.localeCompare(b.display_name, "de");
+    return a.last_at < b.last_at ? 1 : -1;
+  });
+  return bots;
+}
+
+async function listBotsHandler(request, env) {
+  const url = new URL(request.url);
+  const q = String(url.searchParams.get("q") || "").trim().toLowerCase().slice(0, 200);
+  let bots = await assembleBots(env.DB, url.origin);
+  if (q) {
+    bots = bots.filter((bot) => `${bot.display_name} ${bot.slug} ${bot.description}`.toLowerCase().includes(q));
+  }
+  return json({ ok: true, bots });
+}
+
+async function readBot(request, env, param) {
+  const found = await findBot(env.DB, param);
+  if (found.ambiguous) return json({ ok: false, error: "Ambiguous bot" }, 409);
+  if (!found.bot) return json({ ok: false, error: "Bot not found" }, 404);
+  const bots = await assembleBots(env.DB, originOf(request));
+  const bot = bots.find((item) => item.slug === found.bot.slug);
+  if (!bot) return json({ ok: false, error: "Bot not found" }, 404);
+  return json({ ok: true, bot });
+}
+
+function parseCursorTime(raw) {
+  if (raw == null || raw === "") return "";
+  const text = String(raw).trim();
+  if (!Number.isFinite(Date.parse(text))) throw httpError(400, "Invalid before cursor");
+  return text;
+}
+
+async function queryMessages(db, slug, { limit, before, beforeId }) {
+  const params = [slug];
+  let where = "bot_slug = ?";
+  if (before && beforeId) {
+    where += " AND (created_at < ? OR (created_at = ? AND id < ?))";
+    params.push(before, before, beforeId);
+  } else if (before) {
+    where += " AND created_at < ?";
+    params.push(before);
+  }
+  params.push(limit + 1);
+  const desc = await all(
+    db,
+    `SELECT * FROM results WHERE ${where} ORDER BY created_at DESC, id DESC LIMIT ?`,
+    params,
+  );
+  const hasMore = desc.length > limit;
+  const page = (hasMore ? desc.slice(0, limit) : desc).slice().reverse();
+  return { rows: page, hasMore };
+}
+
+async function listMessages(request, env, param) {
+  const found = await findBot(env.DB, param);
+  if (found.ambiguous) return json({ ok: false, error: "Ambiguous bot" }, 409);
+  if (!found.bot) return json({ ok: false, error: "Bot not found" }, 404);
+  const url = new URL(request.url);
+  const before = parseCursorTime(url.searchParams.get("before"));
+  let beforeId = "";
+  const rawBeforeId = url.searchParams.get("before_id");
+  if (rawBeforeId) {
+    beforeId = parseRouteId(rawBeforeId);
+    if (!beforeId) return json({ ok: false, error: "Invalid before_id" }, 400);
+  }
+  const limit = clampLimit(url.searchParams.get("limit"), DEFAULT_MESSAGE_LIMIT, MAX_MESSAGE_LIMIT);
+  const { rows, hasMore } = await queryMessages(env.DB, found.bot.slug, { limit, before, beforeId });
+  const bots = await assembleBots(env.DB, url.origin);
+  const bot = bots.find((item) => item.slug === found.bot.slug);
+  const oldest = rows[0];
+  return json({
+    ok: true,
+    bot,
+    messages: rows.map((row) => present(row, url.origin, { full: true })),
+    has_more: hasMore,
+    next_before: hasMore && oldest ? oldest.created_at : null,
+    next_before_id: hasMore && oldest ? oldest.id : null,
+  });
+}
+
+async function createMessage(request, env, urlParam) {
+  if (!(await authorized(request, env))) return json({ ok: false, error: "Unauthorized" }, 401);
+  const payload = await readPayload(request);
+  const markdown = cleanMarkdown(payload.markdown);
+  if (!markdown) return json({ ok: false, error: "Markdown content is required" }, 400);
+  const role = cleanRole(payload.role);
+  const target = await resolveMessageBot(env.DB, urlParam, payload.botName);
+  const createdAt = nowIso();
+  const title = cleanText(payload.title, 200)
+    || cleanText(extractTitle(markdown), 200)
+    || cleanText(payload.filename, 200)
+    || "";
+  const category = cleanText(payload.category, 60) || "general";
+  const summary = cleanText(payload.summary, 400) || makeSummary(markdown);
+  const task = cleanText(payload.task, 200);
+  const meta = cleanMeta(payload.meta);
+  const botId = cleanText(payload.botId, 80).replace(/\s+/g, "");
+  let explicitId = "";
+  if (payload.id) {
+    explicitId = normalizeId(payload.id);
+    if (!explicitId) return json({ ok: false, error: "Invalid id" }, 400);
+  }
+  const stored = await persistResult(env.DB, {
+    explicitId,
+    createdAt,
+    title,
+    botName: target.displayName,
+    botId,
+    category,
+    summary,
+    markdown,
+    pinned: 0,
+    role,
+    task,
+    meta,
+    botSlug: target.slug,
+  });
+  const origin = originOf(request);
+  const links = storedLinks(origin, stored.id, stored.botSlug);
+  logEvent("info", "message.created", {
+    id: stored.id,
+    bot_slug: stored.botSlug,
+    role,
+    bytes: markdown.length,
+  });
+  return json(
+    {
+      ok: true,
+      id: stored.id,
+      title,
+      bot_name: target.displayName,
+      bot_slug: stored.botSlug,
+      role,
+      task,
+      summary,
+      created_at: createdAt,
+      url: links.url,
+      dashboard_url: `${origin}/?bot=${encodeURIComponent(stored.botSlug)}`,
+      chat_url: links.chat_url,
+      raw_url: links.raw_url,
+    },
+    201,
+    { location: links.chat_url },
+  );
+}
+
+async function putBot(request, env, param) {
+  if (!(await authorized(request, env))) return json({ ok: false, error: "Unauthorized" }, 401);
+  const data = await readJsonBody(request);
+  const found = await findBot(env.DB, param);
+  if (found.ambiguous) return json({ ok: false, error: "Ambiguous bot" }, 409);
+  const urlSlug = botSlug(decodePath(param));
+  if (!found.bot && !urlSlug) return json({ ok: false, error: "Invalid bot" }, 400);
+  const targetSlug = found.bot?.slug || urlSlug;
+  const existing = found.bot;
+  const creating = !existing;
+  let display = existing?.display_name || targetSlug;
+  if (Object.prototype.hasOwnProperty.call(data, "display_name") || Object.prototype.hasOwnProperty.call(data, "name")) {
+    display = cleanText(data.display_name ?? data.name, 120);
+    if (!display) return json({ ok: false, error: "Display name is required" }, 400);
+  }
+  let emoji = existing?.emoji || "";
+  if (Object.prototype.hasOwnProperty.call(data, "emoji") || Object.prototype.hasOwnProperty.call(data, "avatar")) {
+    emoji = cleanEmoji(data.emoji ?? data.avatar ?? "");
+  }
+  let color = existing?.color || "";
+  if (Object.prototype.hasOwnProperty.call(data, "color") || Object.prototype.hasOwnProperty.call(data, "avatar_color")) {
+    color = cleanColor(data.color ?? data.avatar_color ?? "");
+  }
+  let description = existing?.description || "";
+  if (Object.prototype.hasOwnProperty.call(data, "description")) {
+    description = cleanText(data.description, 400);
+  }
+  const now = nowIso();
+  if (creating) {
+    await run(
+      env.DB,
+      `INSERT INTO bots (slug, display_name, emoji, color, description, customized, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 1, ?, ?)`,
+      [targetSlug, display, emoji, color, description, now, now],
+    );
+  } else {
+    await run(
+      env.DB,
+      `UPDATE bots
+       SET display_name = ?, emoji = ?, color = ?, description = ?, customized = 1, updated_at = ?
+       WHERE slug = ?`,
+      [display, emoji, color, description, now, targetSlug],
+    );
+  }
+  const bots = await assembleBots(env.DB, originOf(request));
+  const bot = bots.find((item) => item.slug === targetSlug);
+  logEvent("info", "bot.updated", { slug: targetSlug, created: creating });
+  return json({ ok: true, bot }, creating ? 201 : 200);
 }
 
 function isWordChar(ch) {
@@ -1486,6 +2127,52 @@ function botProfile(name) {
   return { short, color: palette[hash % palette.length], icon: "spark", full: raw };
 }
 
+function botNames(display) {
+  const raw = String(display || "Grokbot").trim() || "Grokbot";
+  const parts = raw.split("·").map((part) => part.trim()).filter(Boolean);
+  return { primary: parts[0] || raw, secondary: parts.slice(1).join(" · "), full: raw };
+}
+
+function botInitials(name) {
+  const primary = botNames(name).primary;
+  const words = primary.split(/[^A-Za-z0-9ÄÖÜäöüß]+/).filter(Boolean);
+  if (!words.length) return "?";
+  if (words.length >= 2) return `${words[0][0]}${words[1][0]}`.toLocaleUpperCase("de-DE");
+  return words[0].slice(0, 2).toLocaleUpperCase("de-DE");
+}
+
+function safeColor(value, fallback) {
+  return /^#[0-9a-fA-F]{6}$/.test(String(value || "")) ? String(value).toLowerCase() : (fallback || "#5b8cff");
+}
+
+function avatarTextColor(hex) {
+  const raw = String(hex || "").replace("#", "");
+  if (!/^[0-9a-fA-F]{6}$/.test(raw)) return "#fff";
+  const r = parseInt(raw.slice(0, 2), 16);
+  const g = parseInt(raw.slice(2, 4), 16);
+  const b = parseInt(raw.slice(4, 6), 16);
+  return (0.299 * r + 0.587 * g + 0.114 * b) / 255 > 0.64 ? "#1a1c14" : "#fff";
+}
+
+function unreadCount(bot, seen, ready) {
+  if (!bot || !bot.last_at) return 0;
+  const mark = seen && seen[bot.slug];
+  if (!mark) return ready ? Number(bot.count) || 1 : 0;
+  if (String(bot.last_at) <= String(mark.at || "")) return 0;
+  const delta = (Number(bot.count) || 0) - (Number(mark.count) || 0);
+  return delta > 0 ? delta : 1;
+}
+
+function ensureSeen(bots, seen, ready) {
+  if (ready) return { seen: seen || {}, ready: true, changed: false };
+  const next = { ...(seen || {}) };
+  for (const bot of bots || []) {
+    if (!bot || !bot.last_at) continue;
+    next[bot.slug] = { at: bot.last_at, count: Number(bot.count) || 0 };
+  }
+  return { seen: next, ready: true, changed: true };
+}
+
 function iconSvg(name) {
   const paths = {
     mail: '<rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="M3 7l9 7 9-7"></path>',
@@ -1504,6 +2191,75 @@ function iconSvg(name) {
   };
   const body = paths[name] || paths.spark;
   return `<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round">${body}</svg>`;
+}
+
+function avatarHtml(bot, large) {
+  const names = botNames(bot?.display_name || "Grokbot");
+  const color = safeColor(bot?.color, botProfile(names.full).color);
+  const cls = large ? "avatar avatar-lg" : "avatar";
+  const inner = bot?.emoji
+    ? `<span class="avatar-emoji">${escapeHtml(bot.emoji)}</span>`
+    : `<span class="avatar-initials">${escapeHtml(botInitials(names.full))}</span>`;
+  return `<span class="${cls}" style="background:${color};color:${avatarTextColor(color)}" aria-hidden="true">${inner}</span>`;
+}
+
+function bubbleHtml(message) {
+  const role = message.role === "user" ? "user" : "bot";
+  const bits = [];
+  const title = String(message.title || "").trim();
+  const category = String(message.category || "").trim();
+  const showCategory = category && category.toLowerCase() !== "general";
+  if (title || showCategory) {
+    const label = [title, showCategory ? category : ""].filter(Boolean).join(" · ");
+    bits.push(`<div class="bubble-kicker">${escapeHtml(label)}</div>`);
+  } else if (role === "user") {
+    bits.push(`<div class="bubble-kicker">Auftrag</div>`);
+  }
+  if (message.task) bits.push(`<div class="bubble-task">${escapeHtml(message.task)}</div>`);
+  bits.push(`<div class="markdown">${renderMarkdown(message.content_md || "")}</div>`);
+  const href = `/r/${encodeURIComponent(message.id)}`;
+  bits.push(`<footer class="bubble-foot"><time datetime="${escapeHtml(message.created_at || "")}">${escapeHtml(formatBubbleClock(message.created_at))}</time><a href="${href}">Öffnen</a></footer>`);
+  return `<article class="bubble role-${role}" data-id="${escapeHtml(message.id)}">${bits.join("")}</article>`;
+}
+
+function chatRowHtml(bot, selectedSlug, seen, ready) {
+  const names = botNames(bot.display_name);
+  const active = bot.slug === selectedSlug;
+  const preview = bot.last_message?.preview || "Noch keine Nachricht";
+  const stamp = bot.last_at ? formatChatStamp(bot.last_at) : "";
+  const unread = unreadCount(bot, seen, ready);
+  const badge = unread
+    ? `<span class="unread" aria-label="${unread} ungelesen">${unread > 99 ? "99+" : unread}</span>`
+    : "";
+  const sub = names.secondary ? `<span class="chat-role">${escapeHtml(names.secondary)}</span>` : "";
+  return `<a class="chat-row${active ? " active" : ""}" href="/bot/${encodeURIComponent(bot.slug)}" data-slug="${escapeHtml(bot.slug)}" aria-current="${active ? "true" : "false"}">${avatarHtml(bot, false)}<span class="chat-main"><span class="chat-top"><span class="chat-name">${escapeHtml(names.primary)}</span><time class="chat-time">${escapeHtml(stamp)}</time></span>${sub}<span class="chat-bottom"><span class="chat-preview">${escapeHtml(preview)}</span>${badge}</span></span></a>`;
+}
+
+function chatListHtml(bots, selectedSlug, seen, ready, query) {
+  const q = String(query || "").trim().toLowerCase();
+  const items = (bots || []).filter((bot) => {
+    if (!q) return true;
+    return `${bot.display_name || ""} ${bot.slug || ""} ${bot.description || ""}`.toLowerCase().includes(q);
+  });
+  if (!items.length) return `<div class="empty-side">Keine Bots</div>`;
+  return items.map((bot) => chatRowHtml(bot, selectedSlug, seen, ready)).join("");
+}
+
+function threadHtml(bot, messages, hasMore, missing) {
+  if (missing) return `<div class="thread-empty"><p>Dieser Bot ist nicht im Dashboard.</p></div>`;
+  if (!bot) return `<div class="thread-empty"><p>Wähle einen Bot aus der Liste.</p></div>`;
+  let html = `<div class="stream-spacer"></div><button type="button" id="load-older" class="load-older"${hasMore ? "" : " hidden"}>Ältere Nachrichten</button>`;
+  let lastDay = "";
+  for (const message of messages || []) {
+    const day = dayLabel(message.created_at);
+    if (day !== lastDay) {
+      html += `<div class="day-sep">${escapeHtml(day)}</div>`;
+      lastDay = day;
+    }
+    html += bubbleHtml(message);
+  }
+  if (!messages || !messages.length) html += `<div class="thread-empty"><p>Noch keine Nachrichten.</p></div>`;
+  return html;
 }
 
 function pageCss() {
@@ -1762,6 +2518,8 @@ function appMain() {
     const download = el("btn-download");
     download.href = `/api/results/${encodeURIComponent(item.id)}/raw`;
     download.setAttribute("download", `${item.id}.md`);
+    const chat = el("btn-chat");
+    if (chat) chat.href = item.bot_slug ? `/bot/${encodeURIComponent(item.bot_slug)}` : "/";
     const pin = el("btn-pin");
     pin.textContent = item.pinned ? "★ Angeheftet" : "☆ Anheften";
     pin.setAttribute("aria-pressed", item.pinned ? "true" : "false");
@@ -2177,8 +2935,8 @@ const CLIENT_FNS = [
   appMain,
 ];
 
-function pageScript() {
-  return `${CLIENT_FNS.map((fn) => fn.toString()).join("\n\n")}\nappMain();\n`;
+function pageScript(fns = CLIENT_FNS, entry = "appMain") {
+  return `${fns.map((fn) => fn.toString()).join("\n\n")}\n${entry}();\n`;
 }
 
 function renderPage({ status = 200, title, description, boot, result }) {
@@ -2243,6 +3001,7 @@ function renderPage({ status = 200, title, description, boot, result }) {
         <button id="font-down" class="btn" type="button" aria-label="Schrift kleiner">A-</button>
         <button id="font-up" class="btn" type="button" aria-label="Schrift größer">A+</button>
         <button id="btn-copy" class="btn" type="button">Link</button>
+        <a id="btn-chat" class="btn" href="${escapeHtml(result?.bot_slug ? `/bot/${encodeURIComponent(result.bot_slug)}` : "/")}">Chat</a>
         <a id="btn-download" class="btn" href="${escapeHtml(chrome.href)}" download="${escapeHtml(chrome.download)}">.md</a>
         <button id="btn-pin" class="btn" type="button" aria-pressed="${result?.pinned ? "true" : "false"}">${escapeHtml(chrome.pin)}</button>
         <button id="btn-delete" class="btn btn-danger" type="button" aria-label="Löschen">Löschen</button>
@@ -2287,6 +3046,489 @@ function renderPage({ status = 200, title, description, boot, result }) {
 </html>`;
   return new Response(html, {
     status,
+    headers: {
+      ...BASE_HEADERS,
+      "content-type": "text/html; charset=utf-8",
+      "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src https: data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+      "x-frame-options": "DENY",
+    },
+  });
+}
+
+function officeCss() {
+  return `
+    :root { color-scheme: dark; --bg:#0b0d12; --side:#10131a; --text:#f4f6fb; --muted:#8b93a7; --line:rgba(255,255,255,.08); --lime:#d6f25c; --read:16.5px; --bubble:#1a1e2b; --bubble-user:#24301a; }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    html, body { height: 100%; }
+    body { margin: 0; background: var(--bg); color: var(--text); font-family: "Segoe UI", "SF Pro Text", "Helvetica Neue", Inter, Roboto, system-ui, sans-serif; overflow: hidden; }
+    body::before { content: ""; position: fixed; left: 0; right: 0; top: 0; height: 2px; background: linear-gradient(90deg, transparent, var(--lime), #8eaaef, transparent); z-index: 80; pointer-events: none; }
+    button, a, input { touch-action: manipulation; }
+    button, input { font: inherit; color: inherit; }
+    button { cursor: pointer; }
+    :focus-visible { outline: 2px solid var(--lime); outline-offset: 2px; }
+    #app { height: 100vh; height: 100dvh; display: flex; min-width: 0; }
+    #sidebar { width: 380px; min-width: 300px; flex: none; display: flex; flex-direction: column; min-height: 0; background: var(--side); border-right: 1px solid var(--line); }
+    #thread { flex: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; background: var(--bg); }
+    .brand-block { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: calc(14px + env(safe-area-inset-top)) 16px 8px; }
+    .brand { display: flex; gap: 12px; align-items: center; min-width: 0; }
+    .logo { width: 40px; height: 40px; border-radius: 12px; display: grid; place-items: center; background: #171a24; color: var(--lime); flex: none; }
+    .logo svg { width: 22px; height: 22px; }
+    .brand h1 { margin: 0; font-size: 17px; letter-spacing: -.02em; }
+    .brand p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
+    .live { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; min-height: 32px; }
+    .dot { width: 8px; height: 8px; border-radius: 99px; background: #3dbe8c; box-shadow: 0 0 0 4px rgba(61,190,140,.16); }
+    .live.offline .dot { background: #ef6d5c; box-shadow: none; }
+    .search-wrap { position: relative; padding: 8px 12px 10px; }
+    .search-wrap svg { position: absolute; left: 24px; top: 50%; width: 16px; height: 16px; transform: translateY(-50%); color: var(--muted); }
+    #search { width: 100%; height: 44px; border-radius: 12px; border: 1px solid var(--line); background: #090a0f; padding: 0 12px 0 38px; }
+    #search::placeholder { color: #727b8e; }
+    #chats { flex: 1; overflow: auto; min-height: 0; padding: 4px 8px calc(12px + env(safe-area-inset-bottom)); }
+    .chat-row { display: flex; gap: 12px; align-items: center; width: 100%; text-decoration: none; color: inherit; border-radius: 14px; padding: 10px; min-height: 76px; }
+    .chat-row:hover { background: rgba(255,255,255,.04); }
+    .chat-row.active { background: #1c2233; }
+    .avatar { width: 48px; height: 48px; border-radius: 50%; display: grid; place-items: center; color: #fff; font-weight: 700; letter-spacing: -.03em; flex: none; }
+    .avatar-lg { width: 42px; height: 42px; font-size: 15px; }
+    .avatar-emoji { font-size: 22px; text-shadow: none; line-height: 1; }
+    .chat-main { min-width: 0; flex: 1; display: grid; gap: 2px; }
+    .chat-top, .chat-bottom { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
+    .chat-name { font-weight: 650; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .chat-role, .chat-preview, .chat-time { color: var(--muted); }
+    .chat-role { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .chat-preview { font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+    .chat-time { font-size: 12px; flex: none; }
+    .unread { min-width: 20px; height: 20px; padding: 0 6px; border-radius: 999px; background: var(--lime); color: #14180c; font-size: 12px; font-weight: 800; display: inline-flex; align-items: center; justify-content: center; flex: none; }
+    .empty-side, .thread-empty { color: var(--muted); }
+    .empty-side { padding: 28px 16px; text-align: center; }
+    .thread-bar { display: flex; align-items: center; gap: 10px; padding: calc(10px + env(safe-area-inset-top)) 14px 10px; border-bottom: 1px solid var(--line); background: #10131a; min-height: 64px; }
+    .back { display: none; align-items: center; min-height: 44px; padding: 0 8px 0 0; color: var(--lime); text-decoration: none; font-weight: 700; flex: none; }
+    .thread-titles { min-width: 0; flex: 1; }
+    .thread-titles h2 { margin: 0; font-size: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .thread-titles p { margin: 2px 0 0; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .thread-actions { display: flex; gap: 8px; flex: none; }
+    .btn { min-height: 40px; min-width: 40px; border-radius: 12px; border: 1px solid var(--line); background: #1a1e2a; color: var(--text); padding: 0 10px; }
+    #stream { flex: 1; overflow: auto; min-height: 0; display: flex; flex-direction: column; gap: 8px; padding: 16px 16px 20px; }
+    .stream-spacer { flex: 1 0 auto; }
+    .load-older, .day-sep { align-self: center; }
+    .load-older { min-height: 40px; border-radius: 999px; border: 1px solid var(--line); background: #151823; color: var(--text); padding: 0 14px; }
+    .day-sep { font-size: 12px; color: var(--muted); background: #151823; border-radius: 999px; padding: 4px 10px; }
+    .bubble { max-width: min(680px, 88%); border-radius: 16px; padding: 8px 12px 6px; }
+    .bubble.role-bot { align-self: flex-start; background: var(--bubble); border-bottom-left-radius: 5px; }
+    .bubble.role-user { align-self: flex-end; background: var(--bubble-user); border-bottom-right-radius: 5px; }
+    .bubble-kicker { font-size: 12px; font-weight: 700; color: var(--lime); margin-bottom: 4px; }
+    .bubble-task { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+    .bubble-foot { display: flex; justify-content: flex-end; align-items: center; gap: 10px; margin-top: 4px; }
+    .bubble-foot time { color: #9aa3b5; font-size: 11px; }
+    .bubble-foot a { color: #c6d4ff; font-size: 12px; font-weight: 700; text-decoration: none; min-height: 32px; display: inline-flex; align-items: center; }
+    .thread-empty { margin: auto; text-align: center; padding: 24px; }
+    .composer-note { border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; text-align: center; padding: 12px 16px calc(12px + env(safe-area-inset-bottom)); }
+    .markdown { font-size: var(--read); line-height: 1.55; overflow-wrap: anywhere; }
+    .markdown > :first-child { margin-top: 0; }
+    .markdown h1, .markdown h2, .markdown h3, .markdown h4 { line-height: 1.25; letter-spacing: -.02em; }
+    .markdown h1 { font-size: 1.25em; margin: .2em 0 .4em; }
+    .markdown h2 { font-size: 1.12em; margin: .8em 0 .35em; }
+    .markdown h3 { font-size: 1.05em; margin: .7em 0 .3em; }
+    .markdown p { margin: .45em 0; }
+    .markdown a { color: #b7c7ff; }
+    .markdown code { font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: .86em; background: rgba(255,255,255,.06); padding: .1em .35em; border-radius: 6px; }
+    .markdown pre { margin: 0; padding: 12px; overflow: auto; }
+    .markdown pre code { background: none; padding: 0; }
+    .codeblock { margin: .6em 0; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: #0c0e14; }
+    .code-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 6px 10px; background: #151823; color: var(--muted); font-size: 12px; }
+    .code-copy { min-height: 36px; border-radius: 8px; border: 1px solid var(--line); background: transparent; }
+    .table-wrap { overflow-x: auto; margin: .6em 0; border: 1px solid var(--line); border-radius: 12px; }
+    table { width: 100%; border-collapse: collapse; min-width: 420px; }
+    th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid rgba(255,255,255,.06); vertical-align: top; }
+    th { font-size: .75em; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); background: #161924; }
+    .markdown ul, .markdown ol { padding-left: 1.2em; margin: .4em 0; }
+    .markdown blockquote { margin: .6em 0; padding: 2px 0 2px 12px; border-left: 3px solid rgba(255,255,255,.2); color: #d7dbe6; }
+    .markdown blockquote.callout { border: 1px solid var(--line); border-left-width: 3px; border-radius: 12px; padding: 10px 12px; background: rgba(255,255,255,.03); }
+    .callout-note { border-left-color: #5b8cff; }
+    .callout-tip { border-left-color: #3dbe8c; }
+    .callout-important { border-left-color: #b07cff; }
+    .callout-warning { border-left-color: #ffb020; }
+    .callout-caution { border-left-color: #f4a261; }
+    .callout-danger { border-left-color: #ef6d5c; }
+    .callout-label { font-size: .72em; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; margin-bottom: .3em; }
+    .markdown hr { border: 0; border-top: 1px solid var(--line); margin: 1em 0; }
+    .markdown img { max-width: 100%; border-radius: 12px; }
+    ul.tasks { list-style: none; padding-left: 0; }
+    ul.tasks label { display: flex; gap: 8px; align-items: flex-start; }
+    @media (max-width: 860px) {
+      #sidebar, #thread { width: 100%; min-width: 0; border-right: 0; }
+      body.route-home #thread { display: none; }
+      body.route-home .chat-row.active { background: transparent; }
+      body.route-chat #sidebar { display: none; }
+      body.route-chat .back { display: inline-flex; }
+      .bubble { max-width: 92%; }
+    }
+    @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+  `;
+}
+
+function officeMain() {
+  const POLL_MS = 8000;
+  const boot = JSON.parse(document.getElementById("boot-data").textContent || "{}");
+  const state = {
+    bots: Array.isArray(boot.bots) ? boot.bots : [],
+    messages: Array.isArray(boot.messages) ? boot.messages : [],
+    slug: boot.selectedSlug || "",
+    explicit: Boolean(boot.explicit),
+    missing: Boolean(boot.missing),
+    hasMore: Boolean(boot.hasMore),
+    nextBefore: boot.nextBefore || "",
+    nextBeforeId: boot.nextBeforeId || "",
+    query: boot.query || "",
+    font: 16.5,
+    seen: {},
+    ready: false,
+    polling: false,
+  };
+  const el = (id) => document.getElementById(id);
+  function storageGet(key) {
+    try { return localStorage.getItem(key); } catch (error) { return null; }
+  }
+  function storageSet(key, value) {
+    try { localStorage.setItem(key, value); } catch (error) { /* private mode */ }
+  }
+  function readSeen() {
+    try {
+      const parsed = JSON.parse(storageGet("gd-seen") || "{}");
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch (error) {
+      return {};
+    }
+  }
+  function writeSeen(seen) {
+    storageSet("gd-seen", JSON.stringify(seen));
+  }
+  function mobileNow() {
+    return window.matchMedia("(max-width: 860px)").matches;
+  }
+  function chatVisible() {
+    return Boolean(state.slug) && (state.explicit || !mobileNow());
+  }
+  function selectedBot() {
+    for (const bot of state.bots) {
+      if (bot.slug === state.slug) return bot;
+    }
+    return null;
+  }
+  function markOpen() {
+    const bot = selectedBot();
+    if (!bot || !bot.last_at || !chatVisible()) return;
+    state.seen[bot.slug] = { at: bot.last_at, count: Number(bot.count) || 0 };
+    writeSeen(state.seen);
+  }
+  function applyFont() {
+    const size = Math.min(26, Math.max(15, Number(state.font) || 16.5));
+    state.font = size;
+    document.documentElement.style.setProperty("--read", `${size}px`);
+    storageSet("gd-font", String(size));
+  }
+  function setLive(ok) {
+    const live = el("live");
+    if (!live) return;
+    live.classList.toggle("offline", !ok);
+    const label = el("live-label");
+    if (label) label.textContent = ok ? "Live" : "Offline";
+  }
+  function renderList() {
+    const root = el("chats");
+    if (!root) return;
+    root.innerHTML = chatListHtml(state.bots, state.slug, state.seen, state.ready, state.query);
+    const count = el("bot-count");
+    if (count) {
+      const n = state.bots.length;
+      count.textContent = `${n} ${n === 1 ? "Bot" : "Bots"}`;
+    }
+  }
+  function renderThread(opts) {
+    const stream = el("stream");
+    const bot = selectedBot();
+    const headName = el("thread-name");
+    const headSub = el("thread-sub");
+    const headAvatar = el("thread-avatar");
+    if (headAvatar) headAvatar.innerHTML = bot ? avatarHtml(bot, true) : "";
+    if (headName) headName.textContent = bot ? botNames(bot.display_name).primary : (state.missing ? "Bot nicht gefunden" : "Grokbot");
+    if (headSub) {
+      const secondary = bot ? (botNames(bot.display_name).secondary || bot.description || "Chat") : "";
+      headSub.textContent = secondary;
+    }
+    if (!stream) return;
+    const previous = stream.scrollHeight - stream.scrollTop;
+    stream.innerHTML = threadHtml(bot, state.messages, state.hasMore, state.missing);
+    if (opts && opts.keepScroll) stream.scrollTop = stream.scrollHeight - previous;
+    else stream.scrollTop = stream.scrollHeight;
+  }
+  async function refreshBots() {
+    const response = await fetch("/api/bots");
+    if (!response.ok) throw new Error("bots failed");
+    const data = await response.json();
+    state.bots = data.bots || [];
+  }
+  async function refreshMessages() {
+    if (!state.slug) return;
+    const response = await fetch(`/api/bots/${encodeURIComponent(state.slug)}/messages?limit=50`);
+    if (response.status === 404) {
+      state.missing = true;
+      state.messages = [];
+      return;
+    }
+    if (!response.ok) throw new Error("messages failed");
+    const data = await response.json();
+    const newest = state.messages.length ? state.messages[state.messages.length - 1].id : "";
+    const incoming = data.messages || [];
+    const incomingNewest = incoming.length ? incoming[incoming.length - 1].id : "";
+    state.hasMore = Boolean(data.has_more);
+    state.nextBefore = data.next_before || "";
+    state.nextBeforeId = data.next_before_id || "";
+    if (incomingNewest !== newest) {
+      state.messages = incoming;
+      renderThread();
+    }
+    if (chatVisible()) markOpen();
+  }
+  function botSignature(bots) {
+    return (bots || []).map((bot) => [bot.slug, bot.last_at, bot.count, bot.display_name, bot.emoji, bot.color, bot.last_message && bot.last_message.preview].join("|")).join("\n");
+  }
+  async function poll() {
+    if (document.hidden || state.polling) return;
+    state.polling = true;
+    try {
+      const before = botSignature(state.bots);
+      await refreshBots();
+      await refreshMessages();
+      if (botSignature(state.bots) !== before) renderList();
+      setLive(true);
+    } catch (error) {
+      setLive(false);
+    } finally {
+      state.polling = false;
+    }
+  }
+  state.font = Number(storageGet("gd-font") || "16.5");
+  state.seen = readSeen();
+  state.ready = storageGet("gd-seen-ready") === "1";
+  const seeded = ensureSeen(state.bots, state.seen, state.ready);
+  state.seen = seeded.seen;
+  state.ready = seeded.ready;
+  if (seeded.changed) {
+    writeSeen(state.seen);
+    storageSet("gd-seen-ready", "1");
+  }
+  markOpen();
+  applyFont();
+  renderList();
+  renderThread();
+  setLive(true);
+  const search = el("search");
+  if (search) {
+    search.value = state.query;
+    if (search.form) search.form.addEventListener("submit", (event) => event.preventDefault());
+    search.addEventListener("input", () => {
+      state.query = search.value;
+      renderList();
+    });
+  }
+  const down = el("font-down");
+  const up = el("font-up");
+  if (down) down.addEventListener("click", () => { state.font -= 1; applyFont(); });
+  if (up) up.addEventListener("click", () => { state.font += 1; applyFont(); });
+  document.addEventListener("click", async (event) => {
+    const older = event.target.closest("#load-older");
+    if (older && state.nextBefore) {
+      older.disabled = true;
+      try {
+        const response = await fetch(`/api/bots/${encodeURIComponent(state.slug)}/messages?limit=50&before=${encodeURIComponent(state.nextBefore)}&before_id=${encodeURIComponent(state.nextBeforeId || "")}`);
+        const data = await response.json();
+        if (response.ok) {
+          const have = new Set(state.messages.map((item) => item.id));
+          const olderRows = (data.messages || []).filter((item) => !have.has(item.id));
+          state.messages = olderRows.concat(state.messages);
+          state.hasMore = Boolean(data.has_more);
+          state.nextBefore = data.next_before || "";
+          state.nextBeforeId = data.next_before_id || "";
+          renderThread({ keepScroll: true });
+        }
+      } catch (error) {
+        older.disabled = false;
+      }
+      return;
+    }
+    const copy = event.target.closest("[data-copy-code]");
+    if (!copy) return;
+    const code = copy.closest(".codeblock")?.querySelector("code");
+    if (!code || !navigator.clipboard) return;
+    try {
+      await navigator.clipboard.writeText(code.textContent || "");
+      const previous = copy.textContent;
+      copy.textContent = "Kopiert";
+      setTimeout(() => { copy.textContent = previous; }, 1400);
+    } catch (error) {
+      copy.textContent = "Kopieren";
+    }
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") poll();
+  });
+  window.addEventListener("focus", () => { poll(); });
+  setInterval(poll, POLL_MS);
+}
+
+const OFFICE_FNS = [
+  escapeHtml,
+  isWordChar,
+  safeUrl,
+  imageSrc,
+  readLink,
+  findMarker,
+  findSingleEmphasis,
+  linkHtml,
+  parseInline,
+  sanitizeLang,
+  codeBlockHtml,
+  splitRow,
+  isDelimRow,
+  alignAttr,
+  parseTable,
+  parseQuote,
+  lineIndent,
+  listMarker,
+  dedentLines,
+  parseList,
+  isHr,
+  isBlockStart,
+  renderMarkdown,
+  berlinParts,
+  berlinKey,
+  shiftBerlinDays,
+  berlinDayNumber,
+  berlinWeekdayShort,
+  formatChatStamp,
+  formatBubbleClock,
+  dayLabel,
+  botProfile,
+  botNames,
+  botInitials,
+  safeColor,
+  avatarTextColor,
+  unreadCount,
+  ensureSeen,
+  avatarHtml,
+  bubbleHtml,
+  chatRowHtml,
+  chatListHtml,
+  threadHtml,
+  officeMain,
+];
+
+async function renderOfficePage(request, env, spec) {
+  const url = new URL(request.url);
+  const origin = url.origin;
+  const query = String(url.searchParams.get("q") || "").slice(0, 200);
+  const bots = await assembleBots(env.DB, origin);
+  let selected = null;
+  let missing = false;
+  const explicit = Boolean(spec.explicit);
+  if (spec.bot) {
+    const found = await findBot(env.DB, spec.bot);
+    if (found.ambiguous || !found.bot) missing = true;
+    else selected = bots.find((bot) => bot.slug === found.bot.slug) || null;
+    if (!selected) missing = true;
+  } else {
+    selected = bots.find((bot) => bot.last_at) || null;
+  }
+  let messages = [];
+  let hasMore = false;
+  let nextBefore = null;
+  let nextBeforeId = null;
+  if (selected) {
+    const page = await queryMessages(env.DB, selected.slug, { limit: DEFAULT_MESSAGE_LIMIT, before: "", beforeId: "" });
+    messages = page.rows.map((row) => present(row, origin, { full: true }));
+    hasMore = page.hasMore;
+    if (hasMore && page.rows[0]) {
+      nextBefore = page.rows[0].created_at;
+      nextBeforeId = page.rows[0].id;
+    }
+  }
+  const names = selected ? botNames(selected.display_name) : { primary: "Grokbot", secondary: "", full: "Grokbot" };
+  const title = missing
+    ? "Bot nicht gefunden · Grokbot Dashboard"
+    : selected && explicit
+      ? `${names.full} · Grokbot Dashboard`
+      : "Grokbot Dashboard";
+  const description = selected?.description || selected?.last_message?.preview || "Chats der Grokbot-Flotte.";
+  const routeClass = explicit ? "route-chat" : "route-home";
+  const js = pageScript(OFFICE_FNS, "officeMain").replace(/<\/(script)/gi, "<\\/$1");
+  const sub = selected ? (names.secondary || selected.description || "Chat") : (missing ? "Nicht gefunden" : "Wähle einen Bot");
+  const html = `<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="dark" />
+<meta name="theme-color" content="#0b0d12" />
+<meta name="description" content="${escapeHtml(description)}" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<title>${escapeHtml(title)}</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23090a0f'/%3E%3Cpath d='M8 23 L16 8 L24 23' fill='none' stroke='%23d6f25c' stroke-width='2'/%3E%3C/svg%3E" />
+<style>${officeCss()}</style>
+</head>
+<body class="office ${routeClass}">
+<div id="app">
+  <aside id="sidebar" aria-label="Bots">
+    <div class="brand-block">
+      <div class="brand">
+        <div class="logo" aria-hidden="true">${iconSvg("spark")}</div>
+        <div>
+          <h1>Chats</h1>
+          <p id="bot-count">${bots.length} ${bots.length === 1 ? "Bot" : "Bots"}</p>
+        </div>
+      </div>
+      <div id="live" class="live"><span class="dot"></span><span id="live-label">Live</span></div>
+    </div>
+    <form class="search-wrap" action="/" method="get">
+      <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="6"></circle><path d="M16 16l4 4"></path></svg>
+      <input id="search" name="q" type="search" placeholder="Bots suchen…" value="${escapeHtml(query)}" autocomplete="off" spellcheck="false" aria-label="Bots suchen" />
+    </form>
+    <nav id="chats" aria-label="Bot-Liste">${chatListHtml(bots, selected?.slug || "", null, false, query)}</nav>
+  </aside>
+  <main id="thread" aria-label="Chat">
+    <header class="thread-bar">
+      <a id="back" class="back" href="/"><span aria-hidden="true">‹</span> Zurück</a>
+      <div id="thread-avatar">${selected ? avatarHtml(selected, true) : ""}</div>
+      <div class="thread-titles">
+        <h2 id="thread-name">${escapeHtml(missing ? "Bot nicht gefunden" : names.primary)}</h2>
+        <p id="thread-sub">${escapeHtml(sub)}</p>
+      </div>
+      <div class="thread-actions">
+        <button id="font-down" class="btn" type="button" aria-label="Schrift kleiner">A-</button>
+        <button id="font-up" class="btn" type="button" aria-label="Schrift größer">A+</button>
+      </div>
+    </header>
+    <div id="stream">${threadHtml(selected, messages, hasMore, missing)}</div>
+    <div class="composer-note">Nur lesen — Senden folgt später.</div>
+  </main>
+</div>
+<script type="application/json" id="boot-data">${serializeBoot({
+    mode: "office",
+    selectedSlug: selected?.slug || null,
+    explicit,
+    missing,
+    bots,
+    messages,
+    hasMore,
+    nextBefore,
+    nextBeforeId,
+    query,
+  })}</script>
+<script>${js}</script>
+</body>
+</html>`;
+  return new Response(html, {
+    status: missing ? 404 : 200,
     headers: {
       ...BASE_HEADERS,
       "content-type": "text/html; charset=utf-8",
@@ -2384,6 +3626,26 @@ async function dispatch(request, env, method) {
     if (method === "GET") return readLatest(request, env);
     return methodNotAllowed(["GET"]);
   }
+  if (path === "/api/bots") {
+    if (method === "GET") return listBotsHandler(request, env);
+    return methodNotAllowed(["GET"]);
+  }
+  if (path === "/api/messages") {
+    if (method === "POST") return createMessage(request, env, "");
+    return methodNotAllowed(["POST"]);
+  }
+  const botMessages = path.match(/^\/api\/bots\/([^/]+)\/messages$/);
+  if (botMessages) {
+    if (method === "GET") return listMessages(request, env, botMessages[1]);
+    if (method === "POST") return createMessage(request, env, botMessages[1]);
+    return methodNotAllowed(["GET", "POST"]);
+  }
+  const botOne = path.match(/^\/api\/bots\/([^/]+)$/);
+  if (botOne) {
+    if (method === "GET") return readBot(request, env, botOne[1]);
+    if (method === "PUT") return putBot(request, env, botOne[1]);
+    return methodNotAllowed(["GET", "PUT"]);
+  }
   if (rawApi) {
     if (method === "GET") return readRaw(request, env, rawApi[1]);
     return methodNotAllowed(["GET"]);
@@ -2406,9 +3668,15 @@ async function dispatch(request, env, method) {
     if (method === "GET") return renderDashboard(request, env, { kind: "latest", bot: url.searchParams.get("bot") || "" });
     return methodNotAllowed(["GET"]);
   }
-  if (path === "/") {
-    if (method === "GET") return renderDashboard(request, env, { kind: "home" });
+  const botPage = path.match(/^\/bot\/([^/]+)$/);
+  if (botPage) {
+    if (method === "GET") return renderOfficePage(request, env, { bot: botPage[1], explicit: true });
     return methodNotAllowed(["GET"]);
+  }
+  if (path === "/") {
+    if (method !== "GET") return methodNotAllowed(["GET"]);
+    if (url.searchParams.get("id")) return renderDashboard(request, env, { kind: "home" });
+    return renderOfficePage(request, env, { bot: url.searchParams.get("bot") || "", explicit: Boolean(url.searchParams.get("bot")) });
   }
   if (path.startsWith("/api/")) return json({ ok: false, error: "Not found" }, 404);
   if (method !== "GET") return methodNotAllowed(["GET"]);
@@ -2458,10 +3726,15 @@ export {
   renderMarkdown,
   extractTitle,
   makeSummary,
+  messagePreview,
   normalizeId,
+  botSlug,
   generateId,
   formatListStamp,
   formatFullStamp,
+  formatChatStamp,
+  unreadCount,
+  ensureSeen,
   keysMatch,
   botProfile,
   berlinParts,
